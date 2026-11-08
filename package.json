@@ -1,0 +1,20 @@
+{
+  "name": "cash-reconciliation",
+  "private": true,
+  "workspaces": [
+    "server",
+    "client"
+  ],
+  "scripts": {
+    "dev": "concurrently -n api,web -c auto \"npm run dev -w server\" \"npm run dev -w client\"",
+    "db:up": "docker compose up -d",
+    "db:down": "docker compose down",
+    "db:setup": "npm run db:setup -w server",
+    "db:seed": "npm run db:seed -w server",
+    "test": "npm run test -w server",
+    "generate:day": "npm run generate:day -w server"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1"
+  }
+}

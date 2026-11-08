@@ -1,0 +1,324 @@
+// Cash Reconciliation & Exceptions Tracker
+// Every monetary amount is USD. Imported transactions are signed:
+// positive is cash in, negative is cash out. Transfers store a
+// positive magnitude; direction is fromAccount -> toAccount.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Source {
+  LEDGER
+  BANK
+}
+
+enum TransactionType {
+  ACH
+  WIRE
+  CHECK
+  JOURNAL
+}
+
+enum Classification {
+  MATCHED
+  AMOUNT_BREAK
+  MISSING_IN_BANK
+  MISSING_IN_LEDGER
+  DUPLICATE
+}
+
+enum ExceptionStatus {
+  OPEN
+  INVESTIGATING
+  RESOLVED
+}
+
+enum ExceptionEventType {
+  CREATED
+  STATUS_CHANGED
+  OWNER_CHANGED
+  NOTE_ADDED
+  RESOLUTION_RECORDED
+}
+
+enum UserRole {
+  MAKER
+  CHECKER
+  ADMIN
+}
+
+enum TransferType {
+  WIRE
+  JOURNAL
+}
+
+/// POSTED: at or under the approval threshold, recorded by the maker.
+/// APPROVED: a different user approved an above-threshold transfer.
+/// PENDING_APPROVAL and REJECTED do not move cash.
+enum TransferStatus {
+  PENDING_APPROVAL
+  APPROVED
+  REJECTED
+  POSTED
+}
+
+model User {
+  id           String   @id
+  name         String
+  email        String   @unique
+  passwordHash String
+  role         UserRole
+  title        String
+  createdAt    DateTime @default(now())
+
+  exceptionsOwned  Exception[]         @relation("ExceptionOwner")
+  notes            ExceptionNote[]
+  events           ExceptionEvent[]
+  transfersMade    Transfer[]          @relation("TransferMaker")
+  transfersChecked Transfer[]          @relation("TransferChecker")
+  closes           DailyClose[]
+  actionLogs       ActionLog[]
+  runs             ReconciliationRun[]
+  batches          ImportBatch[]
+
+  @@map("users")
+}
+
+model Account {
+  id             String  @id
+  name           String
+  accountNumber  String  @unique
+  bankName       String
+  currency       String  @default("USD")
+  targetBalance  Decimal @default(0) @db.Decimal(18, 2)
+  openingBalance Decimal @db.Decimal(18, 2)
+  synthetic      Boolean @default(true)
+
+  transactions  Transaction[]
+  scheduled     ScheduledItem[]
+  matchResults  MatchResult[]
+  transfersFrom Transfer[]     @relation("TransferFrom")
+  transfersTo   Transfer[]     @relation("TransferTo")
+
+  @@map("accounts")
+}
+
+model ImportBatch {
+  id           String   @id
+  source       Source
+  businessDate DateTime @db.Date
+  fileName     String
+  loadedAt     DateTime @default(now())
+  loadedById   String?
+  loadedBy     User?    @relation(fields: [loadedById], references: [id])
+  rowCount     Int
+  synthetic    Boolean  @default(true)
+  transactions Transaction[]
+
+  @@index([businessDate, source])
+  @@map("import_batches")
+}
+
+model Transaction {
+  id           String          @id @default(cuid())
+  batchId      String
+  batch        ImportBatch     @relation(fields: [batchId], references: [id])
+  source       Source
+  accountId    String
+  account      Account         @relation(fields: [accountId], references: [id])
+  type         TransactionType
+  amount       Decimal         @db.Decimal(18, 2)
+  valueDate    DateTime        @db.Date
+  businessDate DateTime        @db.Date
+  referenceId  String
+  description  String
+  counterparty String
+  synthetic    Boolean         @default(true)
+  links        MatchLink[]
+
+  @@index([source, referenceId])
+  @@index([businessDate, accountId])
+  @@map("transactions")
+}
+
+model ReconciliationRun {
+  id           String        @id @default(cuid())
+  businessDate DateTime      @db.Date
+  createdAt    DateTime      @default(now())
+  createdById  String?
+  createdBy    User?         @relation(fields: [createdById], references: [id])
+  results      MatchResult[]
+
+  @@index([businessDate])
+  @@map("reconciliation_runs")
+}
+
+model MatchResult {
+  id               String            @id @default(cuid())
+  runId            String
+  run              ReconciliationRun @relation(fields: [runId], references: [id])
+  classification   Classification
+  referenceId      String
+  accountId        String
+  account          Account           @relation(fields: [accountId], references: [id])
+  /// Set when every ledger row in the group has the same amount.
+  amountLedger     Decimal?          @db.Decimal(18, 2)
+  /// Set when every bank row in the group has the same amount.
+  amountBank       Decimal?          @db.Decimal(18, 2)
+  ledgerValueDate  DateTime?         @db.Date
+  bankValueDate    DateTime?         @db.Date
+  timingDifference Boolean           @default(false)
+  /// Bank value date minus ledger value date, in calendar days.
+  lagDays          Int               @default(0)
+  links            MatchLink[]
+  exception        Exception?
+
+  @@index([runId, classification])
+  @@index([referenceId])
+  @@map("match_results")
+}
+
+model MatchLink {
+  id            String      @id @default(cuid())
+  matchResultId String
+  transactionId String
+  matchResult   MatchResult @relation(fields: [matchResultId], references: [id])
+  transaction   Transaction @relation(fields: [transactionId], references: [id])
+
+  @@unique([matchResultId, transactionId])
+  @@map("match_links")
+}
+
+model Exception {
+  id               String          @id @default(cuid())
+  matchResultId    String          @unique
+  matchResult      MatchResult     @relation(fields: [matchResultId], references: [id])
+  status           ExceptionStatus @default(OPEN)
+  ownerId          String?
+  owner            User?           @relation("ExceptionOwner", fields: [ownerId], references: [id])
+  resolutionReason String?
+  businessDate     DateTime        @db.Date
+  createdAt        DateTime        @default(now())
+  updatedAt        DateTime        @updatedAt
+  notes            ExceptionNote[]
+  events           ExceptionEvent[]
+
+  @@index([status, businessDate])
+  @@map("exceptions")
+}
+
+model ExceptionNote {
+  id          String    @id @default(cuid())
+  exceptionId String
+  exception   Exception @relation(fields: [exceptionId], references: [id])
+  authorId    String
+  author      User      @relation(fields: [authorId], references: [id])
+  body        String
+  createdAt   DateTime  @default(now())
+
+  @@index([exceptionId])
+  @@map("exception_notes")
+}
+
+model ExceptionEvent {
+  id          String             @id @default(cuid())
+  exceptionId String
+  exception   Exception          @relation(fields: [exceptionId], references: [id])
+  actorId     String
+  actor       User               @relation(fields: [actorId], references: [id])
+  eventType   ExceptionEventType
+  fromStatus  ExceptionStatus?
+  toStatus    ExceptionStatus?
+  detail      String?
+  createdAt   DateTime           @default(now())
+
+  @@index([exceptionId, createdAt])
+  @@map("exception_events")
+}
+
+model AppSetting {
+  id                        String   @id @default("default")
+  firmName                  String
+  dataLabel                 String
+  transferApprovalThreshold Decimal  @db.Decimal(18, 2)
+  cutoffTime                String
+  timezone                  String
+  updatedAt                 DateTime @updatedAt
+
+  @@map("app_settings")
+}
+
+model Transfer {
+  id            String         @id @default(cuid())
+  type          TransferType
+  fromAccountId String
+  fromAccount   Account        @relation("TransferFrom", fields: [fromAccountId], references: [id])
+  toAccountId   String?
+  toAccount     Account?       @relation("TransferTo", fields: [toAccountId], references: [id])
+  amount        Decimal        @db.Decimal(18, 2)
+  valueDate     DateTime       @db.Date
+  referenceId   String         @unique
+  beneficiary   String
+  memo          String
+  status        TransferStatus
+  makerId       String
+  maker         User           @relation("TransferMaker", fields: [makerId], references: [id])
+  checkerId     String?
+  checker       User?          @relation("TransferChecker", fields: [checkerId], references: [id])
+  decisionNote  String?
+  decisionAt    DateTime?
+  createdAt     DateTime       @default(now())
+  synthetic     Boolean        @default(true)
+
+  @@index([status])
+  @@map("transfers")
+}
+
+model ScheduledItem {
+  id           String          @id @default(cuid())
+  accountId    String
+  account      Account         @relation(fields: [accountId], references: [id])
+  type         TransactionType
+  amount       Decimal         @db.Decimal(18, 2)
+  settleDate   DateTime        @db.Date
+  referenceId  String          @unique
+  description  String
+  counterparty String
+  synthetic    Boolean         @default(true)
+
+  @@index([settleDate, accountId])
+  @@map("scheduled_items")
+}
+
+model ActionLog {
+  id         String   @id @default(cuid())
+  actorId    String?
+  actor      User?    @relation(fields: [actorId], references: [id])
+  action     String
+  entityType String
+  entityId   String?
+  metadata   Json?
+  createdAt  DateTime @default(now())
+
+  @@index([createdAt])
+  @@index([entityType, entityId])
+  @@map("action_logs")
+}
+
+model DailyClose {
+  id           String   @id @default(cuid())
+  businessDate DateTime @unique @db.Date
+  closedById   String
+  closedBy     User     @relation(fields: [closedById], references: [id])
+  closedAt     DateTime @default(now())
+  passed       Boolean
+  openCount    Int
+  summary      String
+
+  @@map("daily_closes")
+}
